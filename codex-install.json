@@ -1,0 +1,9 @@
+{
+  "name": "@openai/codex",
+  "version": "0.167.0",
+  "platform": "darwin-arm64",
+  "source": "https://github.com/openai/codex",
+  "tarball": "https://registry.npmjs.org/@openai/codex/-/codex-0.167.0-darwin-arm64.tgz",
+  "integrity": "sha512-7YtMDZX/jbWH9+fCVQg7BVsov8WvBzu4iuedXJEDlUdZxaTrYX2bEQwHIn3p0gxgSMfm30HGK9+bZm1aGSZaHw==",
+  "executable": "vendor/codex/package/vendor/aarch64-apple-darwin/bin/codex"
+}

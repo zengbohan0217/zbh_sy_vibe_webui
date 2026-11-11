@@ -1,0 +1,10 @@
+[project]
+name = "codex-local-studio"
+version = "0.1.0"
+description = "Local web UI for OpenAI Codex with custom providers and delivery snapshots"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.codex-local-studio]
+codex-version = "0.167.0"
+codex-source = "https://github.com/openai/codex"

@@ -1,0 +1,17 @@
+{
+  "base_url": "http://39.96.222.203:3000/v1",
+  "model": "claude-opus-5-5",
+  "remember_key": false,
+  "delivery_path": "",
+  "developer_role": "system",
+  "api_key_file": "",
+  "max_output_tokens": 65536,
+  "model_context_window": 400000,
+  "model_auto_compact_token_limit": 280000,
+  "max_parallel_runs": 3,
+  "task_timeout_seconds": 0,
+  "stream_idle_timeout_seconds": 900,
+  "max_auto_continues": 30,
+  "max_context_images": 10,
+  "api_key": ""
+}

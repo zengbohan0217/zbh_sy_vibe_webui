@@ -1,0 +1,54 @@
+# 凭据与本地配置
+# setting.json 默认不含 Key 和个人路径，可以提交；只有在网页勾选“记住 Key”后才会写入 Key，提交前请检查
+setting.json.tmp
+settings.json
+settings.json.tmp
+.env
+.env.*
+token_set.py
+auth.json
+credentials.json
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# 运行数据：任务记录、Codex 会话、浏览器测试工具与截图
+.local/
+.local-test/
+
+# 官方 Codex 二进制与软链接：codex 单文件 258MB，超过 GitHub 100MB 限制，不能提交
+# 克隆后运行 python3 install_codex.py 重新安装；codex-install.json 是版本与校验记录，可以提交
+vendor/
+bin/
+
+# 默认交付输出目录；需要提交交付物时请单独指定路径
+delivery/
+setting.example.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Node（仅浏览器测试工具使用）
+node_modules/
+
+# 日志与进程文件
+*.log
+*.pid
+
+# 系统与编辑器
+.DS_Store
+.AppleDouble
+.idea/
+.vscode/
+*.swp
+*~
