@@ -1,6 +1,7 @@
 import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
 import queue
@@ -13,6 +14,11 @@ import time
 from typing import Any, Callable
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = ImageOps = None
 
 
 def normalize_roles(body: dict[str, Any]) -> dict[str, Any]:
@@ -44,14 +50,37 @@ SHRINK_MIN_BYTES = 300 * 1024
 
 
 def shrink_image_url(url, cache, max_edge=1568, quality=82):
-    """用 macOS 自带 sips 将大截图缩到长边 max_edge 的 JPEG；失败或未变小时保留原图。"""
+    """优先用 Pillow 缩图，macOS 可回退 sips；失败或未变小时保留原图。"""
     if not isinstance(url, str) or not url.startswith("data:image/") or ";base64," not in url or len(url) < SHRINK_MIN_BYTES:
         return url
     digest = hashlib.sha256(url.encode()).hexdigest()
     if digest in cache:
         return cache[digest]
     result = url
-    if os.path.exists(SIPS):
+    if Image is not None and ImageOps is not None:
+        try:
+            raw = base64.b64decode(url.split(",", 1)[1], validate=False)
+            with Image.open(io.BytesIO(raw)) as source:
+                image = ImageOps.exif_transpose(source)
+                image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+                if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+                    rgba = image.convert("RGBA")
+                    background = Image.new("RGB", rgba.size, "white")
+                    background.paste(rgba, mask=rgba.getchannel("A"))
+                    image = background
+                else:
+                    image = image.convert("RGB")
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=quality, optimize=True)
+                candidate = "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode()
+                if len(candidate) < len(url):
+                    result = candidate
+        except Image.DecompressionBombError:
+            cache[digest] = url
+            return url
+        except (OSError, ValueError):
+            result = url
+    if result is url and os.path.exists(SIPS):
         try:
             raw = base64.b64decode(url.split(",", 1)[1], validate=False)
             with tempfile.TemporaryDirectory(prefix="codex-image-") as directory:

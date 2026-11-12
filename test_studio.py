@@ -1,5 +1,8 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
+import re
+import subprocess
 from pathlib import Path
 import tempfile
 import threading
@@ -247,6 +250,25 @@ class StudioTests(unittest.TestCase):
         self.assertEqual(tree["children"][0]["name"], "hello.txt")
         self.assertEqual(self.request("/api/file?path=hello.txt")["text"], "hello")
 
+    def test_tree_returns_posix_paths_with_windows_relative_paths(self):
+        from pathlib import PureWindowsPath
+        folder = self.workspace / "level1" / "level2" / "level3"
+        folder.mkdir(parents=True)
+        (folder / "source.txt").write_text("source", encoding="utf-8")
+        original = Path.relative_to
+        def windows_relative(path, *parents):
+            return PureWindowsPath(original(path, *parents).as_posix())
+        with patch.object(Path, "relative_to", windows_relative):
+            tree = self.request("/api/tree?path=level1/level2")
+            self.assertEqual(tree["path"], "level1/level2")
+            self.assertEqual(tree["children"][0]["path"], "level1/level2/level3")
+            child = self.request("/api/tree?path=" + tree["children"][0]["path"])
+            self.assertEqual(child["children"][0]["path"], "level1/level2/level3/source.txt")
+        (self.workspace / "Delivery").mkdir()
+        self.assertNotIn("Delivery", [item["name"] for item in self.request("/api/tree")["children"]])
+        with self.assertRaises(HTTPError):
+            self.request("/api/tree?path=Delivery")
+
     def test_path_traversal_secrets_and_symlinks_blocked(self):
         (self.workspace / ".env").write_text("secret")
         (self.workspace / "hello.txt").write_text("hello")
@@ -487,8 +509,8 @@ class StudioTests(unittest.TestCase):
     def test_large_screenshots_are_shrunk_and_cached(self):
         import base64, os, struct, zlib
         import provider_bridge
-        if not os.path.exists(provider_bridge.SIPS):
-            self.skipTest("sips 不可用")
+        if provider_bridge.Image is None and not os.path.exists(provider_bridge.SIPS):
+            self.skipTest("Pillow 和 sips 均不可用")
         width, height = 2400, 300
         raw = b"".join(b"\0" + os.urandom(width * 3) for _ in range(height))
         def chunk(kind, data):
@@ -511,7 +533,8 @@ class StudioTests(unittest.TestCase):
         with patch.object(provider_bridge, "SIPS", "/nonexistent/sips"):
             again, _ = provider_bridge.shrink_images(body, cache)
         self.assertEqual(again["input"][0]["content"][0]["image_url"], first)
-        with patch.object(provider_bridge, "SIPS", "/nonexistent/sips"):
+        with patch.object(provider_bridge, "SIPS", "/nonexistent/sips"), \
+             patch.object(provider_bridge, "Image", None), patch.object(provider_bridge, "ImageOps", None):
             fallback, stats = provider_bridge.shrink_images(body, {})
         self.assertEqual(fallback["input"][0]["content"][0]["image_url"], url)
         self.assertEqual(stats["shrunk_images"], 0)
@@ -988,6 +1011,681 @@ class StudioTests(unittest.TestCase):
             self.request("/api/stop", {"id": job["id"]})
             stopped = self.wait_job(job["id"], 10)
             self.assertEqual(stopped["status"], "cancelled")
+
+
+class PlatformTests(unittest.TestCase):
+    def __init__(self, methodName="runTest"):
+        super().__init__(methodName)
+        import delivery
+        import install_codex
+        self.delivery = delivery
+        self.installer = install_codex
+        self.root = TEST_ROOT
+
+    def setUp(self):
+        TEST_ROOT.mkdir(exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=TEST_ROOT)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def test_supported_platform_mapping(self):
+        for system, machine, expected in [
+            ("Darwin", "arm64", "darwin-arm64"), ("Darwin", "x86_64", "darwin-x64"),
+            ("Linux", "aarch64", "linux-arm64"), ("Linux", "x86_64", "linux-x64"),
+            ("Windows", "AMD64", "win32-x64"), ("Windows", "ARM64", "win32-arm64"),
+        ]:
+            with self.subTest(expected=expected), \
+                 patch.object(self.installer.platform, "system", return_value=system), \
+                 patch.object(self.installer.platform, "machine", return_value=machine):
+                self.assertEqual(self.installer.detect_platform(), expected)
+        with patch.object(self.installer.platform, "system", return_value="Other"):
+            with self.assertRaises(SystemExit):
+                self.installer.detect_platform()
+
+    def install_mock(self, tag="win32-x64", failure=False, unsafe=False):
+        import base64
+        import hashlib
+        import io
+        import tarfile
+        from unittest.mock import MagicMock
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as bundle:
+            member = tarfile.TarInfo("../escape" if unsafe else
+                                     "package/vendor/x86_64-pc-windows-msvc/bin/codex.exe")
+            content = b"mock executable"
+            member.size = len(content)
+            bundle.addfile(member, io.BytesIO(content))
+        archive = buffer.getvalue()
+        metadata = {"version": self.installer.VERSION + "-" + tag,
+                    "dist": {"tarball": "https://registry.npmjs.org/mock.tgz",
+                             "integrity": "sha512-" + base64.b64encode(hashlib.sha512(archive).digest()).decode()}}
+        real_run = self.installer.subprocess.run
+        def run_command(command, **kwargs):
+            if command[1:] == ["--version"]:
+                if failure:
+                    raise OSError("missing runtime")
+                return MagicMock(stdout="codex-cli 0.167.0", stderr="", returncode=0)
+            return real_run(command, **kwargs)
+        with patch.object(self.installer, "ROOT", self.root), \
+             patch.object(self.installer, "detect_platform", return_value=tag), \
+             patch.object(self.installer.urllib.request, "urlopen", side_effect=[
+                 io.BytesIO(json.dumps(metadata).encode()), io.BytesIO(archive)]) as fetch, \
+             patch.object(self.installer.subprocess, "run", side_effect=run_command), \
+             patch.object(Path, "symlink_to", side_effect=AssertionError("Windows must not require symlinks")):
+            self.installer.install()
+            self.assertTrue(fetch.call_args_list[0].args[0].endswith(tag))
+
+    def test_windows_install_without_symlink_and_safe_reinstall(self):
+        self.install_mock()
+        entry = self.root / "bin" / "codex.cmd"
+        self.assertIn('"%~dp0..\\vendor\\codex\\', entry.read_text(encoding="utf-8"))
+        record = json.loads((self.root / "codex-install.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["platform"], "win32-x64")
+        executable = app.installed_codex(self.root, windows=True)
+        self.assertTrue(executable.is_file())
+        self.assertEqual(executable.suffix, ".exe")
+        self.install_mock()
+
+    def test_windows_failed_start_preserves_old_install(self):
+        self.install_mock()
+        before = {str(path.relative_to(self.root)): path.read_bytes()
+                  for path in self.root.rglob("*") if path.is_file()}
+        with self.assertRaises(SystemExit):
+            self.install_mock(failure=True)
+        after = {str(path.relative_to(self.root)): path.read_bytes()
+                 for path in self.root.rglob("*") if path.is_file()}
+        self.assertEqual(before, after)
+
+    def test_install_blocks_archive_traversal(self):
+        with self.assertRaises(SystemExit):
+            self.install_mock(unsafe=True)
+        self.assertFalse((self.root / "bin").exists())
+
+    def test_windows_launcher_preserves_unknown_file(self):
+        entry = self.root / "bin" / "codex.cmd"
+        entry.parent.mkdir()
+        entry.write_text("user launcher", encoding="utf-8")
+        with patch.object(self.installer, "ROOT", self.root), \
+             patch.object(self.installer, "detect_platform", return_value="win32-x64"):
+            with self.assertRaises(SystemExit):
+                self.installer.install()
+        self.assertEqual(entry.read_text(encoding="utf-8"), "user launcher")
+
+    def test_windows_old_mac_install_not_reported_as_installed(self):
+        (self.root / "codex-install.json").write_text(json.dumps({
+            "platform": "darwin-arm64", "executable": "vendor/codex/codex"}), encoding="utf-8")
+        self.assertEqual(app.installed_codex(self.root, windows=True), self.root / "bin" / "codex.exe")
+
+    def test_windows_environment_keeps_system_variables_not_secrets(self):
+        with patch.object(app, "IS_WINDOWS", True), patch.dict(app.os.environ, {
+            "SystemRoot": r"C:\Windows", "USERPROFILE": r"C:\Users\tester",
+            "TEMP": r"C:\Temp", "COMSPEC": r"C:\Windows\System32\cmd.exe",
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD", "OPENAI_API_KEY": "secret", "OTHER_SECRET": "secret",
+        }, clear=True):
+            environment = app.process_environment()
+            self.assertEqual(environment["SystemRoot"], r"C:\Windows")
+            self.assertEqual(environment["HOME"], r"C:\Users\tester")
+            self.assertIn("TEMP", environment)
+            self.assertIn("PATHEXT", environment)
+            self.assertNotIn("OPENAI_API_KEY", environment)
+            self.assertNotIn("OTHER_SECRET", environment)
+
+    def test_windows_process_group_and_tree_stop(self):
+        from unittest.mock import MagicMock
+        process = MagicMock(pid=123)
+        process.poll.return_value = None
+        with patch.object(app, "IS_WINDOWS", True), \
+             patch.object(app.subprocess, "run", return_value=MagicMock(returncode=0)) as run:
+            self.assertEqual(app.process_group_options(), {"creationflags": 0x200})
+            app.terminate_process(process)
+            self.assertEqual(run.call_args.args[0][1:], ["/PID", "123", "/T", "/F"])
+        with patch.object(app, "IS_WINDOWS", False):
+            self.assertEqual(app.process_group_options(), {"start_new_session": True})
+
+    def test_directory_open_platform_dispatch(self):
+        with patch.object(app, "IS_WINDOWS", True), patch.object(app.os, "startfile", create=True) as open_file:
+            app.open_directory(self.root)
+            open_file.assert_called_once_with(str(self.root))
+        with patch.object(app, "IS_WINDOWS", False), patch.object(app.sys, "platform", "linux"), \
+             patch.object(app.shutil, "which", return_value="/usr/bin/xdg-open"), \
+             patch.dict(app.os.environ, {"DISPLAY": ":0"}), patch.object(app.subprocess, "run") as run:
+            app.open_directory(self.root)
+            self.assertEqual(run.call_args.args[0], ["/usr/bin/xdg-open", str(self.root)])
+        with patch.object(app, "IS_WINDOWS", False), patch.object(app.sys, "platform", "linux"), \
+             patch.dict(app.os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "服务器"):
+                app.open_directory(self.root)
+
+    def test_quoted_paths_and_foreign_windows_path_error(self):
+        self.assertEqual(self.delivery.local_path('"' + str(self.root) + '"'), self.root)
+        with patch.object(self.delivery, "IS_WINDOWS", False):
+            with self.assertRaisesRegex(ValueError, "WSL"):
+                app.validate_delivery_path(r"D:\交付\delivery")
+
+    def test_atomic_json_rewrites_unicode_and_cleans_failed_temp(self):
+        path = self.root / "交互记录.json"
+        for index in range(3):
+            self.delivery.write_json(path, {"text": "用户中文输入", "index": index})
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["index"], 2)
+        self.assertEqual(len(list(self.root.iterdir())), 1)
+        with patch.object(Path, "replace", side_effect=PermissionError("blocked")):
+            with self.assertRaises(PermissionError):
+                self.delivery.write_json(path, {"index": 4})
+        self.assertEqual(len(list(self.root.iterdir())), 1)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["index"], 2)
+
+    def test_case_insensitive_exclusions_and_windows_snapshot(self):
+        workspace = self.root / "项目"
+        workspace.mkdir()
+        (workspace / "source.txt").write_text("源码", encoding="utf-8")
+        (workspace / "AUTH.JSON").write_text("private", encoding="utf-8")
+        (workspace / "Delivery").mkdir()
+        (workspace / "Delivery" / "old.txt").write_text("old", encoding="utf-8")
+        with patch.object(self.delivery, "IS_WINDOWS", True):
+            result = save_delivery(workspace, self.root / "交付", [], {"base_url": "http://localhost", "model": "test"})
+        payload = Path(result["path"]) / "payload"
+        self.assertEqual([path.name for path in payload.iterdir()], ["source.txt"])
+
+    def test_stop_without_lsof_uses_cooperative_protocol(self):
+        with patch.object(app, "IS_WINDOWS", False), patch.object(app.shutil, "which", return_value=None), \
+             patch.object(app, "stop_server_http", return_value="requested") as stop:
+            self.assertEqual(app.stop_server(8765), "requested")
+            stop.assert_called_once_with(8765)
+
+    def test_http_stop_checks_identity_and_token(self):
+        import io
+        from unittest.mock import MagicMock
+        identity = {"application": "codex-local-studio", "root": str(app.ROOT), "instance": "test-instance"}
+        with patch.object(app.HTTP, "open", side_effect=[
+            io.BytesIO(json.dumps(identity).encode()), io.BytesIO(b'{"stopping": true}')]) as open_request:
+            self.assertIn("已请求", app.stop_server_http(8765))
+            request = open_request.call_args.args[0]
+            self.assertEqual(request.get_header("X-local-token"), "test-instance")
+            self.assertEqual(json.loads(request.data), {"instance": "test-instance"})
+        identity["root"] = str(self.root)
+        with patch.object(app.HTTP, "open", return_value=io.BytesIO(json.dumps(identity).encode())) as open_request:
+            with self.assertRaises(ValueError):
+                app.stop_server_http(8765)
+            self.assertEqual(open_request.call_count, 1)
+
+    def test_cooperative_shutdown_endpoint_rejects_wrong_instance(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with patch.object(app, "stop_all_jobs") as stop_jobs:
+                request = Request("http://127.0.0.1:" + str(server.server_port) + "/api/shutdown",
+                                  data=b'{"instance": "wrong"}',
+                                  headers={"Content-Type": "application/json", "X-Local-Token": app.TOKEN})
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(request, timeout=5)
+                self.assertEqual(denied.exception.code, 403)
+                stop_jobs.assert_not_called()
+                self.assertIn("已请求", app.stop_server_http(server.server_port))
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                stop_jobs.assert_called_once()
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+
+    def test_pillow_shrinks_without_sips_and_handles_invalid_images(self):
+        import base64
+        import io
+        import provider_bridge
+        if provider_bridge.Image is None:
+            self.skipTest("Pillow 未安装")
+        with provider_bridge.Image.new("RGBA", (2400, 300), (10, 20, 30, 128)) as source:
+            buffer = io.BytesIO()
+            source.save(buffer, format="PNG")
+        url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        with patch.object(provider_bridge, "SIPS", "/nonexistent/sips"), \
+             patch.object(provider_bridge, "SHRINK_MIN_BYTES", 0), \
+             patch.object(provider_bridge.subprocess, "run") as run:
+            smaller = provider_bridge.shrink_image_url(url, {})
+            self.assertTrue(smaller.startswith("data:image/jpeg;base64,"))
+            self.assertLess(len(smaller), len(url))
+            with provider_bridge.Image.open(io.BytesIO(base64.b64decode(smaller.split(",", 1)[1]))) as image:
+                self.assertLessEqual(max(image.size), 1568)
+                self.assertEqual(image.mode, "RGB")
+            invalid = "data:image/png;base64,AAAA"
+            self.assertEqual(provider_bridge.shrink_image_url(invalid, {}), invalid)
+            run.assert_not_called()
+
+
+class RemoteTests(unittest.TestCase):
+    def __init__(self, methodName="runTest"):
+        super().__init__(methodName)
+        self.root = TEST_ROOT
+        self.config = TEST_ROOT / "ssh_config"
+
+    def setUp(self):
+        TEST_ROOT.mkdir(exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=TEST_ROOT)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.config = self.root / "ssh_config"
+        self.config.write_text("Host devbox\n    HostName example.invalid\n    ProxyJump jumpbox\n", encoding="utf-8")
+
+    def test_host_aliases_and_include_without_credentials(self):
+        from remote_connection import ssh_hosts
+        include = self.root / "included config"
+        include.write_text("Host included\nInclude ssh_config\n", encoding="utf-8")
+        self.config.write_text('Host *.example !blocked devbox\nInclude "included config"\nHost=second\n'
+                               'IdentityFile "ignored secret path\n', encoding="utf-8")
+        self.assertEqual(ssh_hosts(self.config), ["devbox", "included", "second"])
+
+    def test_connect_validates_before_starting_ssh(self):
+        from remote_connection import RemoteConnection
+        remote = RemoteConnection()
+        with patch("remote_connection.subprocess.Popen") as popen:
+            for host in ["devbox; whoami", "unknown", "-option", "*"]:
+                with self.subTest(host=host), self.assertRaises(ValueError):
+                    remote.connect(self.config, host)
+            popen.assert_not_called()
+
+    def start_files_channel(self, remote, auth=False):
+        import shlex
+        import sys
+        real_popen = subprocess.Popen
+        def spawn(command, **kwargs):
+            code = shlex.split(command[-1])[-1]
+            if auth:
+                code = ("import os,subprocess; "
+                        "subprocess.run([os.environ['SSH_ASKPASS'],'jumpbox password:'],check=True,stdout=subprocess.DEVNULL);"
+                        "subprocess.run([os.environ['SSH_ASKPASS'],'targetbox password:'],check=True,stdout=subprocess.DEVNULL);" + code)
+            kwargs["env"] = dict(kwargs.get("env") or os.environ, STUDIO_REMOTE_STATE_DIR=str(self.root / "remote-state"))
+            return real_popen([sys.executable, "-u", "-c", code], **kwargs)
+        with patch("remote_connection.shutil.which", return_value="/usr/bin/ssh"), \
+             patch("remote_connection.subprocess.Popen", side_effect=spawn) as popen:
+            if auth:
+                remote.start(self.config, "devbox")
+                import time
+                deadline = time.monotonic() + 3
+                while not remote.status()["prompts"] and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            else:
+                remote.start(self.config, "devbox")
+                worker = remote.worker
+                assert worker is not None
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                self.assertTrue(remote.status()["connected"], str(remote.status().get("error")))
+            return popen
+
+    def test_files_channel_has_no_remote_web_requirement(self):
+        from remote_connection import RemoteConnection
+        remote = RemoteConnection()
+        self.addCleanup(remote.disconnect)
+        popen = self.start_files_channel(remote)
+        status = remote.status()
+        self.assertTrue(status["connected"])
+        self.assertIn("home", status)
+        self.assertNotIn("url", status)
+        self.assertNotIn("port", status)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[-2], "devbox")
+        self.assertNotIn("-N", command)
+        self.assertNotIn("-L", command)
+        self.assertIn("python3 -u -c", command[-1])
+        self.assertNotIn("shell", popen.call_args.kwargs)
+        target = status["target_id"]
+        folder = self.root / "remote project 中文"
+        folder.mkdir()
+        (folder / "hello.txt").write_text("远端内容", encoding="utf-8")
+        result = remote.rpc(target, "tree", {"workspace": str(folder)})
+        self.assertEqual(result["children"][0]["path"], "hello.txt")
+        opened = remote.rpc(target, "file", {"workspace": str(folder), "path": "hello.txt"})
+        remote.rpc(target, "save", {"workspace": str(folder), "path": "hello.txt", "text": "服务器修改", "revision": opened["revision"]})
+        self.assertEqual((folder / "hello.txt").read_text(encoding="utf-8"), "服务器修改")
+        with self.assertRaisesRegex(ValueError, "断开或已切换"):
+            remote.rpc("wrong-target", "tree", {"workspace": str(folder)})
+        remote.disconnect()
+        with self.assertRaises(ValueError):
+            remote.rpc(target, "tree", {"workspace": str(folder)})
+
+    def test_failed_remote_python_does_not_leave_connection(self):
+        import sys
+        from remote_connection import RemoteConnection
+        remote = RemoteConnection()
+        remote.password_mode = False
+        self.addCleanup(remote.disconnect)
+        real_popen = subprocess.Popen
+        def fail(command, **kwargs):
+            return real_popen([sys.executable, "-c", "import sys;sys.stderr.write('python3: not found\\n');sys.exit(127)"], **kwargs)
+        with patch("remote_connection.shutil.which", return_value="/usr/bin/ssh"), \
+             patch("remote_connection.subprocess.Popen", side_effect=fail):
+            with self.assertRaises(ValueError):
+                remote.connect(self.config, "devbox")
+            self.assertFalse(remote.status()["connected"])
+            self.assertTrue(remote.status()["error"])
+
+    def test_remote_api_requires_local_token_and_serves_buttons(self):
+        from remote_connection import RemoteConnection
+        remote = RemoteConnection()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        url = "http://127.0.0.1:" + str(server.server_port)
+        try:
+            with patch.object(app, "REMOTE", remote), patch.object(remote, "hosts", return_value={
+                "hosts": ["devbox"], "ssh_config": str(self.config), "ssh_available": True,
+                "error": "", "connection": {"connected": False}}):
+                with urlopen(url + "/api/remote/hosts", timeout=5) as response:
+                    self.assertEqual(json.load(response)["hosts"], ["devbox"])
+                data = json.dumps({"host": "devbox", "port": 8767}).encode()
+                request = Request(url + "/api/remote/connect", data=data,
+                                  headers={"Content-Type": "application/json"})
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(request, timeout=5)
+                self.assertEqual(denied.exception.code, 403)
+                with patch.object(remote, "start", return_value={"connected": True}) as connect:
+                    request.add_header("X-Local-Token", app.TOKEN)
+                    with urlopen(request, timeout=5) as response:
+                        self.assertTrue(json.load(response)["connected"])
+                    connect.assert_called_once_with(None, "devbox")
+                answer_data = json.dumps({"challenge_id": "challenge", "answer": "synthetic-answer"}).encode()
+                answer_request = Request(url + "/api/remote/answer", data=answer_data,
+                                         headers={"Content-Type": "application/json"})
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(answer_request, timeout=5)
+                self.assertEqual(denied.exception.code, 403)
+                with patch.object(remote, "answer", return_value={"submitted": True}) as answer:
+                    answer_request.add_header("X-Local-Token", app.TOKEN)
+                    with urlopen(answer_request, timeout=5) as response:
+                        value = json.load(response)
+                        self.assertTrue(value["submitted"])
+                        self.assertNotIn("synthetic-answer", json.dumps(value))
+                    answer.assert_called_once_with("challenge", "synthetic-answer")
+                fs_data = json.dumps({"target_id": "target", "operation": "tree", "args": {"workspace": "/remote/project"}}).encode()
+                fs_request = Request(url + "/api/remote/fs", data=fs_data, headers={"Content-Type": "application/json"})
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(fs_request, timeout=5)
+                self.assertEqual(denied.exception.code, 403)
+                with patch.object(remote, "rpc", return_value={"children": []}) as rpc:
+                    fs_request.add_header("X-Local-Token", app.TOKEN)
+                    with urlopen(fs_request, timeout=5) as response:
+                        self.assertEqual(json.load(response)["children"], [])
+                    rpc.assert_called_once_with("target", "tree", {"workspace": "/remote/project"})
+                run_data = json.dumps({"target_id": "target", "operation": "run", "args": {
+                    "credential": "untrusted-client-key", "data": {"workspace": "/remote/project", "prompt": "task"}}}).encode()
+                run_request = Request(url + "/api/remote/fs", data=run_data, headers={
+                    "Content-Type": "application/json", "X-Local-Token": app.TOKEN})
+                with patch.object(app, "API_KEY", "trusted-local-key"), patch.object(remote, "rpc", return_value={"id": "remote-run"}) as rpc:
+                    with urlopen(run_request, timeout=5) as response:
+                        raw_response = response.read().decode()
+                    self.assertNotIn("trusted-local-key", raw_response)
+                    arguments = rpc.call_args.args[2]
+                    self.assertEqual(arguments["credential"], "trusted-local-key")
+                    self.assertEqual(arguments["data"]["workspace"], "/remote/project")
+                with urlopen(url, timeout=5) as response:
+                    html = response.read().decode("utf-8")
+                    self.assertIn('id="remote-nav"', html)
+                    self.assertIn('id="remote-top"', html)
+                    self.assertIn('id="remote-form"', html)
+                    self.assertIn('id="remote-disconnect"', html)
+                    self.assertIn('<textarea id="remote-status"', html)
+                    self.assertIn('id="remote-copy-error"', html)
+                    self.assertIn('id="remote-copy-diagnostics"', html)
+                    self.assertIn('id="copy-content"', html)
+                    self.assertIn('id="toast-copy"', html)
+                    self.assertIn('popover="manual" hidden', html)
+                    self.assertIn('id="remote-install-codex"', html)
+                    self.assertIn('id="send-block-reason"', html)
+                    self.assertIn('id="remote-install-inline"', html)
+                    self.assertIn('id="delivery-set-path"', html)
+                    script = (app.STATIC / "app.js").read_text(encoding="utf-8")
+                    declared = set(re.findall(r'id="([^\"]+)"', html))
+                    referenced = set(re.findall(r"\$\('([^']+)'\)", script))
+                    self.assertFalse(referenced - declared, str(referenced - declared))
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+            remote.disconnect()
+
+    @unittest.skipIf(os.name == "nt", "网页 askpass 目前仅支持 POSIX")
+    def test_real_askpass_launcher_two_separate_passwords(self):
+        import time
+        from ssh_askpass import AskpassBroker
+        broker = AskpassBroker(timeout=5)
+        self.addCleanup(broker.close)
+        launcher = broker.launcher
+        for prompt, synthetic in [("jumpuser@jumpbox's password:", "jump-test-answer"),
+                                  ("targetuser@targetbox's password:", "target-test-answer")]:
+            process = subprocess.Popen([str(launcher), prompt], env=dict(os.environ, **broker.environment()),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 4
+                while not broker.prompts() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                challenge = broker.prompts()[0]
+                self.assertEqual(challenge["prompt"], prompt)
+                broker.answer(challenge["id"], synthetic)
+                output, errors = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0)
+                self.assertEqual(output.decode().strip(), synthetic)
+                self.assertEqual(errors, b"")
+                self.assertEqual(broker.prompts(), [])
+                with self.assertRaises(ValueError):
+                    broker.answer(challenge["id"], synthetic)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
+        broker.close()
+        self.assertFalse(launcher.exists())
+
+    @unittest.skipIf(os.name == "nt", "网页 askpass 目前仅支持 POSIX")
+    def test_askpass_rejects_invalid_token_and_unblocks_cancel(self):
+        import socket
+        import time
+        from ssh_askpass import AskpassBroker
+        broker = AskpassBroker(timeout=5)
+        self.addCleanup(broker.close)
+        address = ("127.0.0.1", int(broker.server.server_address[1]))
+        with socket.create_connection(address, timeout=2) as client:
+            client.sendall(b'{"token":"wrong","prompt":"password:"}\n')
+            self.assertEqual(client.recv(1024), b"")
+        self.assertEqual(broker.prompts(), [])
+        results = []
+        thread = threading.Thread(target=lambda: results.append(broker.request("password:")))
+        thread.start()
+        deadline = time.monotonic() + 2
+        while not broker.prompts() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        broker.close()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [None])
+        self.assertEqual(broker.prompts(), [])
+
+    @unittest.skipIf(os.name == "nt", "网页 askpass 目前仅支持 POSIX")
+    def test_async_connect_delivers_two_auth_prompts_without_locking(self):
+        import time
+        from remote_connection import RemoteConnection
+        remote = RemoteConnection()
+        self.addCleanup(remote.disconnect)
+        self.start_files_channel(remote, auth=True)
+        for label, answer in [("jumpbox", "jump-test"), ("targetbox", "target-test")]:
+            deadline = time.monotonic() + 4
+            prompts = []
+            while time.monotonic() < deadline:
+                prompts = remote.status()["prompts"]
+                if prompts and label in prompts[0]["prompt"]:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(prompts)
+            self.assertFalse(remote.status()["connected"])
+            self.assertEqual(remote.answer(prompts[0]["id"], answer), {"submitted": True})
+        worker = remote.worker
+        assert worker is not None
+        worker.join(timeout=4)
+        self.assertTrue(remote.status()["connected"])
+        self.assertNotIn("jump-test", json.dumps(remote.status()))
+
+    def test_remote_files_versions_traversal_and_delivery(self):
+        import base64
+        import remote_files
+        folder = self.root / "remote"
+        folder.mkdir()
+        (folder / "readme.txt").write_text("server text", encoding="utf-8")
+        (folder / "AUTH.JSON").write_text("private", encoding="utf-8")
+        args = {"workspace": str(folder)}
+        tree = remote_files.handle("tree", args)
+        self.assertEqual([item["name"] for item in tree["children"]], ["readme.txt"])
+        opened = remote_files.handle("file", {**args, "path": "readme.txt"})
+        with self.assertRaisesRegex(ValueError, "已变化"):
+            remote_files.handle("save", {**args, "path": "readme.txt", "text": "bad", "revision": "stale"})
+        remote_files.handle("save", {**args, "path": "readme.txt", "text": "new", "revision": opened["revision"]})
+        with self.assertRaises(ValueError):
+            remote_files.handle("file", {**args, "path": "../ssh_config"})
+        remote_files.handle("mkdir", {**args, "path": "newdir"})
+        remote_files.handle("upload", {**args, "path": "newdir/upload.bin", "data": base64.b64encode(b"hello").decode()})
+        downloaded = remote_files.handle("download", {**args, "path": "newdir/upload.bin"})
+        self.assertEqual(base64.b64decode(downloaded["data"]), b"hello")
+        from remote_connection import RemoteConnection
+        remote = RemoteConnection()
+        self.addCleanup(remote.disconnect)
+        self.start_files_channel(remote)
+        result = remote.rpc(remote.status()["target_id"], "delivery", {**args, "destination": str(self.root / "server delivery")})
+        self.assertEqual(result["execution_backend"], "ssh")
+        self.assertEqual(result["runs"], 0)
+        self.assertTrue((Path(result["path"]) / "payload/readme.txt").is_file())
+        self.assertFalse((Path(result["path"]) / "payload/AUTH.JSON").exists())
+
+    def test_remote_jobs_cannot_use_local_executor(self):
+        with self.assertRaisesRegex(ValueError, "本机"):
+            app.start_job({"backend": "ssh", "workspace": str(self.root)})
+        with self.assertRaisesRegex(ValueError, "本机"):
+            app.run_job({"backend": "ssh"}, "not-a-key")
+
+    def execution_fixture(self, real_codex=False):
+        import sys
+        from remote_connection import RemoteConnection
+        root = self.root / "remote-state"
+        binary = root / "bin" / "codex"
+        binary.parent.mkdir(parents=True)
+        if real_codex:
+            if not app.CODEX.is_file():
+                self.skipTest("本机未安装 Codex，真实 CLI 远端执行测试跳过")
+            binary.symlink_to(app.CODEX.resolve())
+        else:
+            source = """import sys,os,json,time
+from pathlib import Path
+from urllib.request import Request,urlopen
+if '--version' in sys.argv:
+ print('codex-cli fixture');raise SystemExit(0)
+prompt=sys.stdin.read()
+print(json.dumps({'type':'thread.started','thread_id':'fixture-thread'}),flush=True)
+if 'WAIT_FOR_STOP' in prompt:
+ time.sleep(60)
+else:
+ options={}
+ for i,arg in enumerate(sys.argv):
+  if arg=='-c':
+   name,value=sys.argv[i+1].split('=',1);options[name]=json.loads(value)
+ base=options['model_providers.local_gateway.base_url']
+ request=Request(base+'/responses',data=json.dumps({'model':'test-model','input':[{'role':'user','content':prompt}],'stream':False}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['LOCAL_CODEX_API_KEY']})
+ with urlopen(request,timeout=10) as response: json.load(response)
+ Path('changed-on-server.txt').write_text('remote change',encoding='utf-8')
+ print(json.dumps({'type':'item.completed','item':{'id':'cmd1','type':'command_execution','command':'create changed-on-server.txt','aggregated_output':'remote change','exit_code':0,'status':'completed'}}),flush=True)
+ print(json.dumps({'type':'item.completed','item':{'id':'msg1','type':'agent_message','text':'[TASK_COMPLETE]'}}),flush=True)
+print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tokens':2}}),flush=True)
+"""
+            binary.write_text("#!" + sys.executable + "\n" + source, encoding="utf-8")
+            binary.chmod(0o700)
+        provider = ThreadingHTTPServer(("127.0.0.1", 0), MockProvider)
+        provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+        provider_thread.start()
+        self.addCleanup(provider.server_close)
+        self.addCleanup(provider.shutdown)
+        remote = RemoteConnection()
+        self.addCleanup(remote.disconnect)
+        self.start_files_channel(remote)
+        workspace = self.root / "服务器项目 中文"
+        workspace.mkdir()
+        destination = self.root / "选择的delivery目录"
+        data = {"workspace": str(workspace), "delivery_path": str(destination),
+                "base_url": "http://127.0.0.1:" + str(provider.server_port) + "/v1", "model": "test-model",
+                "max_auto_continues": 0, "client_request_id": "remote-submit", "prompt": "执行并检查服务器文件"}
+        return remote, workspace, destination, data
+
+    def wait_remote_job(self, remote, run_id, seconds=30):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            result = remote.rpc(remote.status()["target_id"], "job", {"id": run_id, "cursor": 0})
+            if result["job"].get("finished_at"):
+                return result
+            time.sleep(0.05)
+        self.fail("远端任务未按时完成")
+
+    def test_remote_instruction_execution_trajectory_and_delivery_end_to_end(self):
+        remote, workspace, destination, data = self.execution_fixture()
+        target = remote.status()["target_id"]
+        state = remote.rpc(target, "execution-state", {})
+        self.assertTrue(state["codex_installed"])
+        key = "test-remote-upstream-credential"
+        job = remote.rpc(target, "run", {"data": data, "credential": key})
+        duplicate = remote.rpc(target, "run", {"data": data, "credential": key})
+        self.assertEqual(job["id"], duplicate["id"])
+        result = self.wait_remote_job(remote, job["id"])
+        self.assertEqual(result["job"]["status"], "completed")
+        self.assertEqual((workspace / "changed-on-server.txt").read_text(), "remote change")
+        records = destination / "agent_runs" / job["id"]
+        request = json.loads((records / "request.json").read_text(encoding="utf-8"))
+        response = json.loads((records / "response.json").read_text(encoding="utf-8"))
+        final = json.loads((records / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(request["workspace"], str(workspace))
+        self.assertEqual(final["status"], "completed")
+        self.assertTrue(any(event.get("type") == "provider.request" for event in response))
+        self.assertTrue(any(event.get("item", {}).get("type") == "command_execution" for event in response))
+        self.assertNotIn(key, json.dumps(response))
+        self.assertNotIn(key, (self.root / "remote-state/setting.json").read_text(encoding="utf-8"))
+        export = remote.rpc(target, "delivery", {"workspace": str(workspace), "destination": str(destination)})
+        package = Path(export["path"])
+        self.assertEqual(export["runs"], 1)
+        self.assertTrue((package / "payload/changed-on-server.txt").is_file())
+        self.assertTrue((package / "agent_runs" / job["id"] / "response.json").is_file())
+        commands = json.loads((package / "validation_logs/commands.json").read_text())
+        self.assertEqual(len(commands["commands"]), 1)
+        moved = self.root / "改选保存路径"
+        chosen = remote.rpc(target, "delivery-path", {"workspace": str(workspace), "destination": str(moved)})
+        self.assertTrue((Path(chosen["trajectory_path"]) / job["id"] / "response.json").is_file())
+        remote.disconnect()
+        self.start_files_channel(remote)
+        restored = remote.rpc(remote.status()["target_id"], "execution-state", {})
+        self.assertEqual(restored["jobs"][0]["id"], job["id"])
+
+    def test_remote_stop_timeout_and_disconnect_preserve_final_trajectory(self):
+        remote, workspace, destination, data = self.execution_fixture()
+        target = remote.status()["target_id"]
+        data.update(prompt="WAIT_FOR_STOP", task_timeout_seconds=1, client_request_id="timeout")
+        timed = remote.rpc(target, "run", {"data": data, "credential": "test-remote-key"})
+        result = self.wait_remote_job(remote, timed["id"])
+        self.assertEqual(result["job"]["status"], "timeout")
+        self.assertEqual(json.loads((destination / "agent_runs" / timed["id"] / "result.json").read_text())["status"], "timeout")
+        data.update(task_timeout_seconds=0, client_request_id="stop")
+        stopped = remote.rpc(target, "run", {"data": data, "credential": "test-remote-key"})
+        with self.assertRaisesRegex(ValueError, "仍有任务"):
+            remote.rpc(target, "delivery", {"workspace": str(workspace), "destination": str(destination)})
+        remote.rpc(target, "stop", {"id": stopped["id"]})
+        result = self.wait_remote_job(remote, stopped["id"])
+        self.assertEqual(result["job"]["status"], "cancelled")
+        data.update(client_request_id="disconnect")
+        disconnected = remote.rpc(target, "run", {"data": data, "credential": "test-remote-key"})
+        remote.disconnect()
+        final = json.loads((destination / "agent_runs" / disconnected["id"] / "result.json").read_text())
+        self.assertEqual(final["status"], "cancelled")
+
+    def test_remote_real_codex_model_response_and_trajectory(self):
+        remote, workspace, destination, data = self.execution_fixture(real_codex=True)
+        job = remote.rpc(remote.status()["target_id"], "run", {"data": data, "credential": "test-real-remote-key"})
+        result = self.wait_remote_job(remote, job["id"], seconds=60)
+        self.assertEqual(result["job"]["status"], "completed", str(result["job"].get("error")))
+        self.assertTrue(any(event.get("item", {}).get("type") == "agent_message" for event in result["events"]))
+        self.assertTrue((destination / "agent_runs" / job["id"] / "response.json").is_file())
 
 
 if __name__ == "__main__":

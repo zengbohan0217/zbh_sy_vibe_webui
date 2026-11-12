@@ -5,6 +5,9 @@ description = "Local web UI for OpenAI Codex with custom providers and delivery 
 requires-python = ">=3.9"
 dependencies = []
 
+[project.optional-dependencies]
+images = ["Pillow>=11.3.0,<13"]
+
 [tool.codex-local-studio]
 codex-version = "0.167.0"
 codex-source = "https://github.com/openai/codex"

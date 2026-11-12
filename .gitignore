@@ -21,6 +21,7 @@ id_ed25519
 # 克隆后运行 python3 install_codex.py 重新安装；codex-install.json 是版本与校验记录，可以提交
 vendor/
 bin/
+tmp/
 
 # 默认交付输出目录；需要提交交付物时请单独指定路径
 delivery/

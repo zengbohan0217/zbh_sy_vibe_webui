@@ -8,8 +8,10 @@ import os
 from pathlib import Path
 import secrets
 import shlex
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -19,16 +21,32 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 import uuid
 import webbrowser
 
-from delivery import EXCLUDED_DIRS, excluded_file, now, redact, save_delivery, save_run_records, scrub, write_json
+from delivery import EXCLUDED_DIRS, IS_WINDOWS, excluded_file, is_link, local_path, now, redact, save_delivery, save_run_records, scrub, write_json
 from provider_bridge import ResponsesBridge, normalize_roles
 from task_groups import assign_task_ids, group_tasks
 from run_scheduler import RunScheduler, workspace_conflict
+from remote_connection import REMOTE
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_URL = "http://39.96.222.203:3000/v1"
 LOCAL = ROOT / ".local"
 SETTINGS_PATH = ROOT / "setting.json"
-CODEX = ROOT / "bin" / "codex"
+def installed_codex(root=ROOT, windows=IS_WINDOWS):
+    if not windows:
+        return root / "bin" / "codex"
+    try:
+        record = json.loads((root / "codex-install.json").read_text(encoding="utf-8"))
+        executable = root / record["executable"]
+        if (record.get("platform", "").startswith("win32-")
+                and executable.suffix.lower() == ".exe"
+                and (root / "vendor" / "codex").resolve() in executable.resolve().parents):
+            return executable
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return root / "bin" / "codex.exe"
+
+
+CODEX = installed_codex()
 STATIC = ROOT / "web"
 LOCK = threading.RLock()
 TOKEN = secrets.token_urlsafe(32)
@@ -113,7 +131,8 @@ def read_key_file(value):
 def initialize():
     global API_KEY
     LOCAL.mkdir(mode=0o700, exist_ok=True)
-    LOCAL.chmod(0o700)
+    if not IS_WINDOWS:
+        LOCAL.chmod(0o700)
     (LOCAL / "codex-home").mkdir(mode=0o700, exist_ok=True)
     path = SETTINGS_PATH
     legacy = LOCAL / "settings.json"
@@ -139,7 +158,7 @@ def initialize():
         legacy.unlink()
     for path in sorted((LOCAL / "runs").glob("*.json"), key=lambda item: item.stat().st_mtime):
         try:
-            job = json.loads(path.read_text())
+            job = json.loads(path.read_text(encoding="utf-8"))
             if job["status"] in {"queued", "running", "stopping"}:
                 job.update(status="interrupted", finished_at=now(), error="本地服务曾退出，任务已中断；记录已保留。")
             if "max_output_tokens" in str(job.get("error", "")):
@@ -166,7 +185,7 @@ def validate_url(value):
 def workspace_path(value):
     if not str(value).strip():
         raise ValueError("请先在页面输入项目绝对路径并点击“打开项目”。")
-    path = Path(str(value)).expanduser()
+    path = local_path(value, "工作目录")
     if not path.is_absolute():
         raise ValueError("工作目录需要使用绝对路径。")
     path = path.resolve(strict=True)
@@ -181,7 +200,7 @@ def validate_delivery_path(value):
     value = str(value).strip()
     if not value:
         return ""
-    path = Path(value).expanduser()
+    path = local_path(value, "delivery 保存目录")
     if not path.is_absolute():
         raise ValueError("delivery 保存目录需要使用绝对路径。")
     path = path.resolve()
@@ -413,6 +432,41 @@ def codex_command(job):
     return command
 
 
+def process_group_options():
+    if IS_WINDOWS:
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)}
+    return {"start_new_session": True}
+
+
+def terminate_process(process, force=False):
+    if process.poll() is not None:
+        return
+    if IS_WINDOWS:
+        system_root = os.environ.get("SystemRoot", os.environ.get("WINDIR", r"C:\Windows"))
+        taskkill = str(Path(system_root) / "System32" / "taskkill.exe")
+        result = subprocess.run([taskkill, "/PID", str(process.pid), "/T", "/F"],
+                                capture_output=True, timeout=10)
+        if result.returncode and process.poll() is None:
+            raise OSError("无法结束 Windows 任务进程树：" + result.stderr.decode("utf-8", errors="replace"))
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def open_directory(target):
+    if IS_WINDOWS:
+        os.startfile(str(target))
+    elif sys.platform == "darwin":
+        subprocess.run(["/usr/bin/open", str(target)], check=True, timeout=10)
+    else:
+        executable = shutil.which("xdg-open")
+        if not executable or not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            raise ValueError("服务器没有可用的桌面文件管理器；文件已保存在服务器路径，可通过 SSH/SFTP 查看。")
+        subprocess.run([executable, str(target)], check=True, timeout=10)
+
+
 def stop_job(job, reason="cancelled"):
     with LOCK:
         if job.get("finished_at") or job["status"] not in {"queued", "running", "stopping"}:
@@ -426,18 +480,12 @@ def stop_job(job, reason="cancelled"):
     if bridge:
         bridge.cancel()
     if process:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        terminate_process(process)
         def force_stop():
             with LOCK:
                 still_ours = PROCESSES.get(job["id"]) is process
             if still_ours:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                terminate_process(process, force=True)
         timer = threading.Timer(3, force_stop)
         timer.daemon = True
         timer.start()
@@ -576,7 +624,23 @@ def stop_all_jobs():
         stop_job(job)
 
 
+def process_environment():
+    names = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM")
+    if IS_WINDOWS:
+        names += ("SystemRoot", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE",
+                  "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+                  "TEMP", "TMP", "SYSTEMDRIVE", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432")
+    environment = {name: os.environ[name] for name in names if name in os.environ}
+    if IS_WINDOWS and "USERPROFILE" in environment:
+        environment.setdefault("HOME", environment["USERPROFILE"])
+    bundled_paths = [CODEX.resolve().parent, CODEX.resolve().parent.parent / "codex-path"]
+    environment["PATH"] = os.pathsep.join(str(path) for path in bundled_paths if path.is_dir()) + os.pathsep + environment.get("PATH", os.defpath)
+    return environment
+
+
 def run_job(job, key):
+    if job.get("backend", "local") != "local":
+        raise ValueError("本机执行器不能执行远端项目任务。")
     process, timeout_timer, stderr_thread, bridge = None, None, None, None
     outcome = "failed"
     try:
@@ -585,10 +649,7 @@ def run_job(job, key):
                 return
             job.update(status="running", started_at=now(), queue_reason=None)
             persist_job(job, key)
-        environment = {name: os.environ[name] for name in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM")
-                       if name in os.environ}
-        bundled_paths = [CODEX.resolve().parent, CODEX.resolve().parent.parent / "codex-path"]
-        environment["PATH"] = os.pathsep.join(str(path) for path in bundled_paths if path.is_dir()) + os.pathsep + environment.get("PATH", os.defpath)
+        environment = process_environment()
         invocation = dict(job)
         process_key = key
         bridge = ResponsesBridge(job["base_url"], key, max_output_tokens=job.get("max_output_tokens", TOKEN_DEFAULTS["max_output_tokens"]),
@@ -603,7 +664,7 @@ def run_job(job, key):
         environment.update(CODEX_HOME=str(LOCAL / "codex-home"), LOCAL_CODEX_API_KEY=process_key, NO_COLOR="1")
         process = subprocess.Popen(codex_command(invocation), cwd=job["workspace"], env=environment,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, encoding="utf-8", errors="replace", start_new_session=True, bufsize=1)
+                                   text=True, encoding="utf-8", errors="replace", bufsize=1, **process_group_options())
         with LOCK:
             PROCESSES[job["id"]] = process
         if job.get("stop_reason"):
@@ -648,10 +709,11 @@ def run_job(job, key):
             timeout_timer.cancel()
         if process and process.poll() is None:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                terminate_process(process, force=True)
                 process.wait(timeout=5)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                pass
+            except (OSError, subprocess.SubprocessError) as error:
+                outcome = "failed"
+                job["cleanup_error"] = redact(str(error), key)
         if stderr_thread:
             stderr_thread.join(timeout=5)
         if process:
@@ -679,6 +741,8 @@ def run_job(job, key):
 
 
 def start_job(data, auto_continue_count=0, auto_failures=0):
+    if data.get("backend", "local") != "local":
+        raise ValueError("远端文件模式不使用本机 Codex 执行，避免误改同名本机目录；远端任务执行器尚未接入。")
     with LOCK:
         if SHUTTING_DOWN:
             raise ValueError("工作台正在退出，不能提交新任务。")
@@ -792,12 +856,12 @@ def safe_file(relative, directory=False, workspace=None):
     current = root
     for part in candidate.parts:
         current = current / part
-        if current.is_symlink():
-            raise ValueError("网页不读取符号链接。")
+        if current.is_symlink() or (current.exists() and is_link(current)):
+            raise ValueError("网页不读取符号链接或 junction。")
     path = (root / candidate).resolve(strict=True)
     if path != root and root not in path.parents:
         raise ValueError("路径越界。")
-    if any(part in EXCLUDED_DIRS for part in candidate.parts) or excluded_file(path):
+    if any(part.lower() in EXCLUDED_DIRS for part in candidate.parts) or excluded_file(path):
         raise ValueError("该路径属于凭据或排除目录，不在网页中展示。")
     key_file = Path(SETTINGS["api_key_file"]).expanduser().resolve() if SETTINGS.get("api_key_file") else None
     if path == LOCAL or LOCAL in path.parents or path == SETTINGS_PATH.resolve() or path == key_file:
@@ -840,6 +904,12 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             if parsed.path == "/api/state":
                 return self.send(public_state())
+            if parsed.path == "/api/identity":
+                return self.send({"application": "codex-local-studio", "root": str(ROOT), "instance": TOKEN})
+            if parsed.path == "/api/remote/hosts":
+                return self.send(REMOTE.hosts())
+            if parsed.path == "/api/remote/status":
+                return self.send(REMOTE.status())
             if parsed.path.startswith("/api/jobs/"):
                 job_id = parsed.path.rsplit("/", 1)[-1]
                 cursor = max(0, int(query.get("cursor", ["0"])[0]))
@@ -849,6 +919,8 @@ class Handler(BaseHTTPRequestHandler):
                     job = JOBS[job_id]
                     return self.send({"job": job_summary(job), "events": job["events"][cursor:cursor + 200],
                                       "cursor": min(cursor + 200, len(job["events"])), "total": len(job["events"])})
+            if parsed.path in ("/api/tree", "/api/file") and query.get("backend", ["local"])[0] != "local":
+                raise ValueError("远端路径只能通过 SSH 文件接口操作，不会读取同名本机路径。")
             if parsed.path == "/api/tree":
                 workspace = query.get("workspace", [SETTINGS["workspace"]])[0]
                 if not workspace:
@@ -856,12 +928,12 @@ class Handler(BaseHTTPRequestHandler):
                 path, root = safe_file(query.get("path", [""])[0], directory=True, workspace=workspace)
                 children = []
                 for child in sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
-                    if child.is_symlink() or child.name in EXCLUDED_DIRS or excluded_file(child):
+                    if is_link(child) or child.name.lower() in EXCLUDED_DIRS or excluded_file(child):
                         continue
-                    children.append({"name": child.name, "path": str(child.relative_to(root)), "directory": child.is_dir()})
+                    children.append({"name": child.name, "path": child.relative_to(root).as_posix(), "directory": child.is_dir()})
                     if len(children) >= 500:
                         break
-                return self.send({"path": str(path.relative_to(root)), "children": children})
+                return self.send({"path": path.relative_to(root).as_posix(), "children": children})
             if parsed.path == "/api/file":
                 path, _ = safe_file(query.get("path", [""])[0], workspace=query.get("workspace", [SETTINGS["workspace"]])[0])
                 if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
@@ -883,13 +955,48 @@ class Handler(BaseHTTPRequestHandler):
             self.local_request(mutation=True)
             if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 raise ValueError("请求必须是 JSON。")
+            path = urlsplit(self.path).path
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 1024 * 1024:
+            limit = 8 * 1024 * 1024 if path == "/api/remote/fs" else 1024 * 1024
+            if length <= 0 or length > limit:
                 raise ValueError("请求体大小不合法。")
             data = json.loads(self.rfile.read(length))
             if not isinstance(data, dict):
                 raise ValueError("请求体必须是对象。")
             path = urlsplit(self.path).path
+            if path == "/api/remote/hosts":
+                return self.send(REMOTE.hosts(data.get("ssh_config")))
+            if path == "/api/remote/connect":
+                return self.send(REMOTE.start(data.get("ssh_config"), data.get("host")))
+            if path == "/api/remote/fs":
+                args = data.get("args", {})
+                if not isinstance(args, dict):
+                    raise ValueError("远端参数必须是对象。")
+                args = dict(args)
+                if data.get("operation") == "run":
+                    options = args.get("data", {})
+                    if not isinstance(options, dict):
+                        raise ValueError("远端任务参数必须是对象。")
+                    options = dict(options)
+                    source = str(options.get("api_key_file", "")).strip()
+                    args["credential"] = read_key_file(source) if source else API_KEY
+                    options.pop("api_key_file", None)
+                    args["data"] = options
+                else:
+                    args.pop("credential", None)
+                result = REMOTE.rpc(data.get("target_id"), data.get("operation"), args)
+                if data.get("operation") == "file" and isinstance(result, dict):
+                    original = result.get("text", "")
+                    result["text"] = redact(original, API_KEY)
+                    if result["text"] != original:
+                        result["editable"] = False
+                return self.send(result)
+            if path == "/api/remote/answer":
+                return self.send(REMOTE.answer(data.get("challenge_id"), data.get("answer")))
+            if path == "/api/remote/disconnect":
+                return self.send(REMOTE.disconnect())
+            if data.get("backend", "local") != "local":
+                raise ValueError("该接口仅操作本机；远端路径必须使用带 target_id 的文件接口，不会自动回退本机。")
             if path == "/api/settings":
                 return self.send(update_settings(data))
             if path == "/api/models":
@@ -929,8 +1036,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(result)
             if path == "/api/open":
                 target = workspace_path(data.get("path", SETTINGS["workspace"]))
-                subprocess.run(["/usr/bin/open", str(target)], check=True, timeout=10)
+                open_directory(target)
                 return self.send({"opened": str(target)})
+            if path == "/api/shutdown":
+                if data.get("instance") != TOKEN:
+                    raise PermissionError("工作台实例已变化，未停止服务。")
+                stop_all_jobs()
+                self.send({"stopping": True})
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
             if path == "/api/run":
                 return self.send(start_job(data), status=202)
             if path == "/api/stop":
@@ -992,9 +1106,34 @@ def listening_pids(port):
     return {int(value) for value in result.stdout.split()}
 
 
+def stop_server_http(port):
+    url = "http://127.0.0.1:" + str(port)
+    try:
+        with HTTP.open(url + "/api/identity", timeout=5) as response:
+            identity = json.loads(response.read(65536).decode("utf-8"))
+    except URLError as error:
+        if isinstance(error.reason, ConnectionRefusedError):
+            return "端口 " + str(port) + " 没有运行中的工作台，无需停止。"
+        raise ValueError("无法确认工作台身份，未停止服务：" + str(error)) from error
+    if (not isinstance(identity, dict) or identity.get("application") != "codex-local-studio"
+            or Path(identity.get("root", "")).resolve() != ROOT
+            or not isinstance(identity.get("instance"), str) or not identity["instance"]):
+        raise ValueError("端口不属于当前项目的工作台，未停止任何程序。")
+    request = Request(url + "/api/shutdown",
+                      data=json.dumps({"instance": identity["instance"]}).encode("utf-8"),
+                      headers={"Content-Type": "application/json", "X-Local-Token": identity["instance"]})
+    with HTTP.open(request, timeout=15) as response:
+        result = json.loads(response.read(65536).decode("utf-8"))
+    if result.get("stopping") is not True:
+        raise ValueError("工作台未确认停止请求。")
+    return "已请求工作台停止；正在清理任务并保存运行记录。"
+
+
 def stop_server(port):
     if not 1 <= port <= 65535:
         raise ValueError("端口必须在 1 到 65535 之间。")
+    if IS_WINDOWS or not shutil.which("lsof"):
+        return stop_server_http(port)
     pids = listening_pids(port)
     if not pids:
         return "端口 " + str(port) + " 没有运行中的工作台，无需停止。"
@@ -1074,6 +1213,7 @@ def main():
             for worker in workers:
                 worker.join(timeout=0.1)
         server.server_close()
+        REMOTE.disconnect()
 
 
 if __name__ == "__main__":

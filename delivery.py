@@ -1,9 +1,10 @@
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shutil
+import stat
 import tempfile
 from datetime import datetime, timezone
 
@@ -44,23 +45,53 @@ def scrub(value, key=""):
     return redact(value, key) if isinstance(value, str) else value
 
 
+IS_WINDOWS = os.name == "nt"
+
+
+def local_path(value, label="路径"):
+    value = str(value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    if not IS_WINDOWS and PureWindowsPath(value).drive:
+        raise ValueError(label + "属于 Windows 路径，但服务运行在 Linux/macOS；"
+                         + "请使用服务所在机器的绝对路径，WSL 请使用 /mnt/盘符/...。")
+    return Path(value).expanduser()
+
+
+def is_link(path):
+    if path.is_symlink():
+        return True
+    if IS_WINDOWS:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return False
+
+
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.chmod(0o600)
-    temporary.replace(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="." + path.name + "-",
+                                         suffix=".tmp", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        if not IS_WINDOWS:
+            temporary.chmod(0o600)
+        temporary.replace(path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 def save_run_records(destination, job, key=""):
-    destination = Path(destination).expanduser().resolve()
+    destination = local_path(destination, "delivery 保存目录").resolve()
     run_id = str(job["id"])
     if not run_id or Path(run_id).name != run_id or run_id in {".", ".."}:
         raise ValueError("运行记录 ID 不合法。")
     folder = destination / "agent_runs" / run_id
     for path in (destination, destination / "agent_runs", folder):
-        if path.is_symlink():
+        if path.is_symlink() or (path.exists() and is_link(path)):
             raise ValueError("交互记录目录不能使用符号链接。")
     safe = scrub(job, key)
     write_json(folder / "request.json", {k: safe.get(k) for k in
@@ -79,7 +110,7 @@ def save_run_records(destination, job, key=""):
 
 def excluded_file(path):
     name = path.name.lower()
-    return (path.name in EXCLUDED_NAMES or name == ".env" or name.startswith(".env.")
+    return (name in {item.lower() for item in EXCLUDED_NAMES} or name == ".env" or name.startswith(".env.")
             or name.endswith((".pem", ".key", ".p12", ".pfx", ".pyc")))
 
 
@@ -88,11 +119,11 @@ def iter_payload(workspace, excluded_roots=()):
     for current, directories, filenames in os.walk(workspace, followlinks=False):
         base = Path(current)
         directories[:] = sorted(name for name in directories
-                                if name not in EXCLUDED_DIRS and not (base / name).is_symlink()
+                                if name.lower() not in EXCLUDED_DIRS and not is_link(base / name)
                                 and (base / name).resolve() not in excluded_roots)
         for name in sorted(filenames):
             path = base / name
-            if path.is_symlink() or excluded_file(path) or not path.is_file():
+            if is_link(path) or excluded_file(path) or not path.is_file():
                 continue
             yield path
 
@@ -102,8 +133,8 @@ class ExportBlocked(ValueError):
 
 
 def save_delivery(workspace, destination, jobs, settings, key="", excluded_files=()):
-    workspace = Path(workspace).resolve(strict=True)
-    destination = Path(destination).expanduser()
+    workspace = local_path(workspace, "工作目录").resolve(strict=True)
+    destination = local_path(destination, "交付目标")
     if not destination.is_absolute():
         raise ValueError("交付目标需要使用绝对路径。")
     destination = destination.resolve()
@@ -140,7 +171,8 @@ def save_delivery(workspace, destination, jobs, settings, key="", excluded_files
             output = payload / relative
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(data)
-            output.chmod(source.stat().st_mode & 0o777 & ~0o022)
+            if not IS_WINDOWS:
+                output.chmod(source.stat().st_mode & 0o777 & ~0o022)
             files.append({"relative_path": relative.as_posix(), "file_type": source.suffix.lstrip("."),
                           "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                           "category": "project_payload"})

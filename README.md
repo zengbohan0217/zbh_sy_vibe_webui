@@ -11,13 +11,15 @@ python3 install_codex.py
 python3 app.py
 ```
 
-- `install_codex.py` 从官方 npm 包下载固定版本 `0.167.0`，核对 SHA-512 后安装到 `vendor/` 和 `bin/`，并写入版本与校验记录 `codex-install.json`（该文件会提交，二进制不会）。目前只支持 macOS Apple Silicon。
+- `install_codex.py` 从官方 npm 包下载固定版本 `0.167.0`，核对 SHA-512 后安装到 `vendor/` 和 `bin/`，并写入版本与校验记录 `codex-install.json`（该文件会提交，二进制不会）。支持 macOS、Linux、Windows 的 x64 和 ARM64；Windows 使用无需软链接权限的 `bin/codex.cmd`，工作台直接启动 vendor 中的 `codex.exe`。
 - 仓库自带的 `setting.json` 不含 Key 和个人路径。启动后在网页“连接与模型”里填写 Key、模型和交付目录即可。
 - `setting.example.json` 是同结构的空白模板；`setting.json` 被改乱或误删时，可用 `cp setting.example.json setting.json` 恢复。
 
 ## 启动
 
-运行环境：macOS Apple Silicon、Python 3.9 或更新版本。日常启动不需要 Node，也不需要安装第三方 Python 包。
+运行环境：macOS、Linux 或 Windows（x64/ARM64），Python 3.9 或更新版本。基础启动不需要 Node 或第三方 Python 包；Windows 可将 `python3` 命令替换为 `py -3`，例如 `py -3 install_codex.py`、`py -3 app.py`。
+
+跨平台图片缩小使用可选 Pillow：`python3 -m pip install "Pillow>=11.3.0,<13"`（Windows 使用 `py -3 -m pip install "Pillow>=11.3.0,<13"`）。未安装时 macOS 可回退系统 `sips`，Linux/Windows 保留原图；安装后需重启服务。
 
 ```bash
 python3 app.py
@@ -61,7 +63,31 @@ python3 app.py --help
 python3 app.py --stop --port 8765
 ```
 
-也支持 `./start.command --stop --port 8765`。该命令核验端口监听进程的 Python 启动命令与当前项目目录，只停止本项目工作台，不修改配置，不自动重启。通过 `SIGTERM` 正常退出，运行中的 Codex 任务会随服务停止；不会使用 `kill -9` 强制结束其他程序。端口没有进程时正常提示，无关应用占用端口时拒绝停止。
+macOS 也支持 `./start.command --stop --port 8765`。有 `lsof` 的 POSIX 环境核验进程启动命令和项目目录后发送 `SIGTERM`；Windows 或缺少 `lsof` 的 Linux 核验当前工作台的项目路径、实例令牌后请求 HTTP 协作关闭。均不修改配置或自动重启，不会根据端口猜测并结束无关程序。
+
+工作台关闭时停止自身 Codex 任务：POSIX 先发送 `SIGTERM`，3 秒后必要时强制结束；Windows 使用 `taskkill /T /F` 强制结束该任务的进程树，并非温和的 `SIGTERM` 退出。
+
+## 本地页面操作服务器文件
+
+左侧和顶部“远程连接”读取本机 `~/.ssh/config`，选择具体 Host 别名。继承 SSH 配置中的 User、Port、IdentityFile、ProxyJump；页面、API 和模型配置仍在本机，通过 SSH 标准输入输出直接操作最终目标服务器。
+
+服务器需要 SSH 和 Python 3.9+（远端为 Linux/macOS），不需要安装整套工作台、运行远端网页或开放 8767 端口。连接时通过 SSH 内存加载文件与 Codex 执行器；任务私有状态保存在服务器 `~/.codex-local-studio-remote/`，断开重连可恢复历史。编码需要服务器 Codex：优先使用 PATH/用户目录已有 CLI，没有时点击“安装远端 Codex”下载并校验官方包到用户私有目录。
+
+macOS/Linux 支持网页认证弹窗：通过系统 OpenSSH 的 askpass 机制逐次显示跳板机、目标机的密码、密钥口令或验证码提示。分别核对提示账号/主机后输入，回答只在进程内用于当前挑战，不写入配置、delivery、浏览器存储或日志；不要把密码发送到聊天。可取消连接，单次提示等待 3 分钟，整条连接最多等待 6 分钟。
+
+使用 `BatchMode=no` 和 `StrictHostKeyChecking=ask`：首次主机指纹必须先核实，用户显式输入 yes 后由 OpenSSH 存入 known_hosts；指纹变化不会自动接受。原生 Windows 暂不支持网页 askpass，仍使用严格非交互密钥认证；需要密码可在 WSL 运行本机工作台。文件模式不需要服务器安装 Codex。
+
+`banner exchange` / `UNKNOWN port 65535` 可能表示 ProxyJump 子链路认证或网络超时，不表示应把 SSH 端口改为 65535。尚未出现密码提示时，应检查跳板机可达性及目标 SSH 服务；新增密码窗口不等于已排除网络问题。
+
+连接成功点击“在本页打开服务器项目”，可填写服务器绝对路径或从 home 逐层选择目录。工作目录左侧可显式切换“本机项目 / SSH 服务器项目”；标题显示目标 Host。右侧文件树来自服务器，可在线编辑 UTF-8 文本、新建目录、上传/下载单文件（上限 2MiB），保存使用内容版本校验，上传拒绝覆盖已有文件。凭据、缓存、符号链接和疑似秘密文件受到访问限制。
+
+服务器项目打开后，可在本地输入需求，实际由服务器 Codex 运行并修改服务器文件；日志/工具调用/模型回答实时回到本地，支持续聊、摘要、停止、超时及历史恢复。使用本机配置的模型地址和 Key，Key 经 SSH 只进入远端执行器内存，不写远端配置；模型接口由服务器访问，所以不能把只能在本机访问的 localhost 模型地址当成远端可用地址。
+
+点击“保存 delivery”可浏览服务器保存根目录，选择后立即设置 trajectory 自动保存位置；手输路径使用“设为 trajectory 自动保存目录”生效。默认是服务器项目的 `delivery/`，已有记录会补存到新选择目录，运行中也可改保存路径。每条任务实际写入 `<所选目录>/agent_runs/<run_id>/request.json`、`response.json`、`result.json`，摘要任务可附带 `context_summary.json`；不伪造用户、工具或模型记录。
+
+任务结束后点击“创建交付快照”，生成 `<所选目录>/<时间戳>/payload/` 源码包及同层 `agent_runs/` 的真实轨迹副本、命令验证日志等。运行中 trajectory 持续保存，但源码快照需要先停止或等待完成。写入选定目录失败会明确显示错误，私有运行记录仍保留，可修复权限后重新设置路径补存。
+
+断连/切换后旧 target_id 失效，请求不会自动回退本机，写入超时也不会自动重试。断开 SSH 时执行器停止自身任务并保存终态，重新连接恢复已保存历史；不保证意外服务器断电后的任务继续运行。同一远端用户的执行器有私有运行锁，避免双连接重复调度。网页/API 始终使用本机 loopback 的 Host/Origin/令牌保护，无远端网页监听或隧道端口。
 
 ## 查看与复制文件路径
 
@@ -75,7 +101,7 @@ python3 app.py --stop --port 8765
 
 项目根目录下的 `setting.json`。
 
-文件权限为 `600`，不会出现在网页文件预览或 delivery 的源码包中。默认内容不含 Key 和个人路径，可以提交到 GitHub；Key 只有勾选“记住 Key”后才会写入该文件，此时请不要提交。
+POSIX 文件权限为 `600`；Windows 使用目标用户目录的 ACL，请确保配置与 `.local/` 不对其他用户开放。配置不会出现在网页文件预览或 delivery 的源码包中。默认内容不含 Key 和个人路径，可以提交到 GitHub；Key 只有勾选“记住 Key”后才会写入该文件，此时请不要提交。
 
 配置结构如下，`api_key` 的空字符串替换为接口服务发放的 Token / API Key，`model` 替换为接口支持的模型 ID：
 
@@ -137,7 +163,7 @@ python3 app.py --stop --port 8765
 
 当前网关会把工具结果（如 Codex 查看截图）里的图片 base64 当文本计 Token：实测一张 100KB 小图在工具结果中约 9.8 万 Token，放在用户消息中只多 16 Token。几张游戏截图就可能触发 `prompt is too long: ... > 1000000`，而 Codex 按图片估算，不会提前压缩。
 
-本地代理会在转发前把工具结果中的图片移到紧随其后的用户消息中（实测网关接受且模型能看到图片），并只保留最近 6 张，较早的替换为文字说明；保留的截图若超过 300KB，会用 macOS 自带 `sips` 缩到长边 1568 像素的 JPEG（与 Claude 自身的缩放尺寸一致，实测 3MB PNG 约降到 400KB），失败时保留原图。原会话记录不修改。请求诊断卡会显示 `incoming_bytes`、`moved_images`、`dropped_images`、`shrunk_images` 和实际转发的 `request_bytes`。
+本地代理会在转发前把工具结果中的图片移到紧随其后的用户消息中（实测网关接受且模型能看到图片），并只保留最近 6 张，较早的替换为文字说明；较大的 base64 截图优先使用可选 Pillow 缩到长边不超过 1568 像素的 JPEG，支持 macOS/Linux/Windows；macOS 可回退自带 `sips`。只有结果更小时才采用，无可用后端或处理失败时保留原图。原会话记录不修改。请求诊断卡会显示 `incoming_bytes`、`moved_images`、`dropped_images`、`shrunk_images` 和实际转发的 `request_bytes`。
 
 截图数量可调整，默认 `6`，范围 `0–50`，`0` 表示不发送任何图片：
 
